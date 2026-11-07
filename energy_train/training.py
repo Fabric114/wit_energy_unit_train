@@ -3,12 +3,13 @@
 本模块不得在导入时加载 ultralytics 或 torch；它们只在函数体内导入。
 """
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-from .common import project_path, sha256, valid_name
+from .common import PROJECT_ROOT, project_path, sha256, valid_name
 
 CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val"})
 TOP_LEVEL_KEYS = frozenset({"model", "train", "stages"})
@@ -16,6 +17,13 @@ TOP_LEVEL_KEYS = frozenset({"model", "train", "stages"})
 
 class TrainingError(ValueError):
     """配置、数据集或运行前检查失败。"""
+
+
+class DatasetCheckError(TrainingError):
+    def __init__(self, issues):
+        self.issues = list(issues)
+        lines = [f"数据集校验发现 {len(self.issues)} 项问题："] + [f"- {item}" for item in self.issues]
+        super().__init__("\n".join(lines))
 
 
 @dataclass(frozen=True)
@@ -104,3 +112,97 @@ def load_config(path):
         model_sha256=sha256(model),
         stages=tuple(stages),
     )
+
+
+def _read_yaml_mapping(path):
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise TrainingError(f"无法解析 data.yaml: {path}") from exc
+    if not isinstance(data, dict):
+        raise TrainingError(f"data.yaml 顶层必须是映射: {path}")
+    return data
+
+
+def _count(directory, pattern):
+    return len(list(directory.rglob(pattern))) if directory.is_dir() else 0
+
+
+def validate_dataset(data_yaml, datasets_root=None):
+    """校验 build_dataset 产出的数据集；问题集中收集后一次抛出 DatasetCheckError。"""
+    data_path = project_path(data_yaml).resolve()
+    if data_path.name != "data.yaml":
+        raise TrainingError(f"--data 必须指向 data.yaml 文件，而不是目录或其他文件: {data_yaml}")
+    if not data_path.is_file():
+        raise TrainingError(f"data.yaml 不存在: {data_path}")
+    root = (PROJECT_ROOT / "datasets") if datasets_root is None else project_path(datasets_root)
+    root = root.resolve()
+    dataset_dir = data_path.parent
+    issues = []
+
+    if dataset_dir.parent != root:
+        issues.append(f"数据集必须位于数据集根目录 {root} 下的一级版本目录中，当前位于 {dataset_dir.parent}")
+
+    data = _read_yaml_mapping(data_path)
+    summary_path, manifest_path = dataset_dir / "summary.json", dataset_dir / "manifest.jsonl"
+    if not manifest_path.is_file():
+        issues.append("缺少 manifest.jsonl")
+    summary = None
+    if not summary_path.is_file():
+        issues.append("缺少 summary.json")
+    else:
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            issues.append("summary.json 无法解析")
+    if summary is not None:
+        if summary.get("schema_version") != 2:
+            issues.append(f"summary.json 的 schema_version 应为 2，当前为 {summary.get('schema_version')!r}")
+        if summary.get("class_names") != {"0": "energy_unit"}:
+            issues.append(f"summary.json 的 class_names 应为 {{'0': 'energy_unit'}}，当前为 {summary.get('class_names')!r}")
+    split_images = summary.get("split_images") if summary is not None else None
+    if not isinstance(split_images, dict):
+        issues.append("summary.json 缺少 split_images")
+        split_images = {}
+
+    if data.get("names") not in ({0: "energy_unit"}, ["energy_unit"]):
+        issues.append(f"data.yaml 的 names 应只包含 energy_unit，当前为 {data.get('names')!r}")
+    if data.get("train") != "images/train":
+        issues.append(f"data.yaml 的 train 应为 images/train，当前为 {data.get('train')!r}")
+    if data.get("val") != "images/val":
+        issues.append(f"data.yaml 的 val 应为 images/val，当前为 {data.get('val')!r}")
+    if (dataset_dir / str(data.get("path"))).resolve() != dataset_dir.resolve():
+        issues.append(f"data.yaml 的 path 与数据集目录不符（{data.get('path')!r}），请更新 path 或重新构建")
+
+    has_test = "test" in split_images
+    if ("test" in data) != has_test:
+        issues.append("data.yaml 的 test 键与 summary.json 的 test 划分不一致")
+    if "test" in data and data.get("test") != "images/test":
+        issues.append(f"data.yaml 的 test 应为 images/test，当前为 {data.get('test')!r}")
+
+    for split in ("train", "val"):
+        count = split_images.get(split)
+        if not isinstance(count, int) or count <= 0:
+            issues.append(f"{split} 划分必须至少有 1 张图片，summary.json 记录为 {count!r}")
+    for split, expected in split_images.items():
+        if not isinstance(expected, int):
+            continue
+        images = _count(dataset_dir / "images" / split, "*.png")
+        labels = _count(dataset_dir / "labels" / split, "*.txt")
+        if images != expected:
+            issues.append(f"{split} 划分的 PNG 数量为 {images}，summary.json 记录 {expected}")
+        if labels != expected:
+            issues.append(f"{split} 划分的标签 txt 数量为 {labels}，summary.json 记录 {expected}")
+
+    if issues:
+        raise DatasetCheckError(issues)
+    return {
+        "data_yaml": str(data_path),
+        "dataset_dir": str(dataset_dir),
+        "data_yaml_sha256": sha256(data_path),
+        "summary_sha256": sha256(summary_path),
+        "manifest_sha256": sha256(manifest_path),
+        "split_images": dict(split_images),
+        "group_splits": dict(summary.get("group_splits", {})),
+        "has_test": has_test,
+    }
