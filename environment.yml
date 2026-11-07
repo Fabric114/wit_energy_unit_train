@@ -1,0 +1,13 @@
+name: wit_energy_unit
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - -r requirements/capture.txt
+variables:
+  # These apply only while this environment is active, not to other projects.
+  PYTHONNOUSERSITE: "1"
+  PYTHONPATH: ""

@@ -1,0 +1,16 @@
+# CLI parameters override this file. Relative paths are relative to project root.
+output_root: raw
+width: 640
+height: 480
+fps: 30
+interval: 0.5
+warmup_frames: 30
+max_images: 0            # maximum NEW images this invocation; 0 = unlimited
+duration: 0              # seconds including warmup; 0 = unlimited
+preview: true
+auto: true
+blur_threshold: 50.0     # scene-dependent diagnostic, not a universal cutoff
+reject_blur: false
+duplicate_threshold: 2.0 # BGR mean absolute difference; 0 disables filtering
+serial: null
+note: ""
