@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import yaml
@@ -16,7 +17,7 @@ from energy_train.common import PROJECT_ROOT, sha256
 from energy_train.dataset import build_dataset
 from energy_train.training import (
     CONTROLLED_KEYS, DatasetCheckError, TrainingError, code_version, default_run_name,
-    load_config, plan_run, run_training, validate_dataset,
+    load_config, main, plan_run, run_training, validate_dataset,
 )
 
 
@@ -455,6 +456,47 @@ class RunTests(unittest.TestCase):
                               "print(any(m in sys.modules for m in ('ultralytics', 'torch')))"],
                              cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
         self.assertEqual(out.stdout.strip(), "False")
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.weight = self.root / "w.pt"
+        self.weight.write_bytes(b"fake-weights")
+        self.data = make_dataset(self.root)
+        self.datasets = self.root / "datasets"
+        self.runs = self.root / "runs"
+        self.cfg_path = self.root / "cfg.yaml"
+        self.cfg_path.write_text(yaml.safe_dump({"model": str(self.weight), **PlanTests.SINGLE},
+                                                allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def common_args(self):
+        return ["--config", str(self.cfg_path), "--data", str(self.data),
+                "--datasets-root", str(self.datasets), "--runs-root", str(self.runs)]
+
+    def test_cli_check_only_from_other_cwd(self):
+        tool = PROJECT_ROOT / "script" / "train.py"
+        base = [sys.executable, str(tool), *self.common_args()]
+        ok = subprocess.run(base + ["--check-only", "--name", "c1", "--batch", "8"],
+                            cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        out = json.loads(ok.stdout)
+        self.assertEqual(out["stages"][0]["args"]["batch"], 8)
+        self.assertFalse(self.runs.exists())
+        (self.data.parent / "summary.json").unlink()
+        bad = subprocess.run(base + ["--check-only"], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("训练失败", bad.stderr)
+
+    def test_main_maps_training_errors_to_exit_codes(self):
+        with mock.patch("energy_train.training.run_training", side_effect=RuntimeError("boom")):
+            self.assertEqual(main([*self.common_args(), "--name", "m1"]), 1)
+        with mock.patch("energy_train.training.run_training", side_effect=KeyboardInterrupt):
+            self.assertEqual(main([*self.common_args(), "--name", "m2"]), 130)
 
 
 if __name__ == "__main__":

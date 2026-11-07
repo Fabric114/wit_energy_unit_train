@@ -3,9 +3,11 @@
 本模块不得在导入时加载 ultralytics 或 torch；它们只在函数体内导入。
 """
 
+import argparse
 import json
 import math
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -420,3 +422,71 @@ def run_training(config, dataset, plan, *, overrides=None, command=None, yolo_cl
     except Exception as exc:
         _finish(provenance, run_dir, "failed", exc)
         raise
+
+
+OVERRIDE_HELP = {
+    "batch": "覆盖所有阶段的 batch（显存不足时用 8）",
+    "epochs": "覆盖所有阶段的 epochs",
+    "device": "训练设备，例如 0 或 cpu",
+    "workers": "数据加载线程数",
+}
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(description="用 build_dataset 产出的数据集训练 YOLO 检测模型，并记录 provenance。")
+    parser.add_argument("--config", required=True, help="训练配置 YAML，例如 configs/train/yolo11n.yaml")
+    parser.add_argument("--data", required=True, help="build_dataset 产出的 data.yaml，不是数据集目录")
+    parser.add_argument("--name", help="run 名称；默认按配置名、数据集名和时间生成")
+    parser.add_argument("--check-only", action="store_true", help="只校验配置与数据集并打印计划，不训练")
+    parser.add_argument("--batch", type=int, help=OVERRIDE_HELP["batch"])
+    parser.add_argument("--epochs", type=int, help=OVERRIDE_HELP["epochs"])
+    parser.add_argument("--device", help=OVERRIDE_HELP["device"])
+    parser.add_argument("--workers", type=int, help=OVERRIDE_HELP["workers"])
+    parser.add_argument("--datasets-root", default="datasets", help="数据集根目录，默认 datasets")
+    parser.add_argument("--runs-root", default="runs", help="训练输出根目录，默认 runs")
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    overrides = {key: getattr(args, key) for key in OVERRIDE_KEYS if getattr(args, key) is not None}
+    try:
+        config = load_config(args.config)
+        dataset = validate_dataset(args.data, args.datasets_root)
+        plan = plan_run(config, dataset, runs_root=args.runs_root, name=args.name, overrides=overrides)
+    except DatasetCheckError as exc:
+        print(f"训练失败: {exc}", file=sys.stderr)
+        print(json.dumps({"issues": exc.issues}, ensure_ascii=False, indent=2))
+        return 2
+    except (TrainingError, FileExistsError, OSError, yaml.YAMLError) as exc:
+        print(f"训练失败: {exc}", file=sys.stderr)
+        return 2
+    if args.check_only:
+        print(json.dumps({"dataset": dataset, **plan}, ensure_ascii=False, indent=2))
+        return 0
+    run_dir = plan["run_dir"]
+    try:
+        provenance = run_training(config, dataset, plan, overrides=overrides,
+                                  command=["script/train.py", *raw_argv])
+    except KeyboardInterrupt:
+        print("训练已中断", file=sys.stderr)
+        return 130
+    except FileExistsError as exc:
+        if exc.filename == run_dir:
+            print(f"训练失败: {exc}", file=sys.stderr)
+            return 2
+        print(f"训练失败: {exc}（详见 {run_dir}/provenance.json）", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"训练失败: {exc}（详见 {run_dir}/provenance.json）", file=sys.stderr)
+        return 1
+    summary = {
+        "run_dir": provenance["run_dir"],
+        "status": provenance["status"],
+        "final_weights": provenance["final_weights"],
+        "stages": [{"name": stage["name"], "metrics": stage["metrics"]} for stage in provenance["stages"]],
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
