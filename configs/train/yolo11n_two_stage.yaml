@@ -1,0 +1,16 @@
+# configs/train/yolo11n_two_stage.yaml
+model: weights/pretrained/yolo11n.pt
+train:
+  batch: 16
+  imgsz: 640
+  degrees: 10
+  patience: 30
+  seed: 42
+stages:                                # 可选；有则按顺序执行，每阶段参数 = train 合并本阶段覆盖
+  - name: stage1_freeze
+    epochs: 20
+    freeze: 10
+  - name: stage2_finetune
+    epochs: 30
+    optimizer: AdamW
+    lr0: 0.001

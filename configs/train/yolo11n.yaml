@@ -1,0 +1,9 @@
+# configs/train/yolo11n.yaml
+model: weights/pretrained/yolo11n.pt   # 起点权重，相对项目根；必须是已存在的本地 .pt
+train:                                 # 原样传给 YOLO.train() 的参数，所有阶段共享
+  epochs: 150
+  batch: 16
+  imgsz: 640
+  degrees: 10
+  patience: 30
+  seed: 42
