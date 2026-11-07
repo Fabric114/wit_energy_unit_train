@@ -216,6 +216,19 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(TrainingError):
                     load_config(self.write(content))
 
+    def test_cfg_key_cannot_smuggle_controlled_settings(self):
+        with self.assertRaises(TrainingError):
+            load_config(self.write({"model": str(self.weight), "train": {"cfg": "extra.yaml"}}))
+
+    def test_values_that_cannot_be_recorded_are_rejected(self):
+        path = self.root / "date.yaml"
+        path.write_text(f"model: {self.weight}\ntrain:\n  note: 2026-11-07\n", encoding="utf-8")
+        with self.assertRaises(TrainingError):
+            load_config(path)
+        path.write_text(f"model: {self.weight}\ntrain:\n  seed: .nan\n", encoding="utf-8")
+        with self.assertRaises(TrainingError):
+            load_config(path)
+
     def test_bare_model_name_is_not_downloaded(self):
         with self.assertRaises(TrainingError) as ctx:
             load_config(self.write({"model": "yolo11n_not_here.pt", "train": {}}))

@@ -19,7 +19,7 @@ from .common import PROJECT_ROOT, atomic_json, project_path, sha256, utc_now, va
 
 REQUIRED_ULTRALYTICS = "8.4.154"
 
-CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val"})
+CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val", "cfg"})
 OVERRIDE_KEYS = ("batch", "epochs", "device", "workers")
 TOP_LEVEL_KEYS = frozenset({"model", "train", "stages"})
 
@@ -102,6 +102,10 @@ def load_config(path):
         raise TrainingError(f"无法读取训练配置: {path}") from exc
     if not isinstance(content, dict):
         raise TrainingError("训练配置顶层必须是映射")
+    try:
+        json.dumps(content, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise TrainingError("训练配置含无法写入 provenance 的值（日期、NaN 或 Inf），请改为字符串或数字") from exc
     unknown = set(content) - TOP_LEVEL_KEYS
     if unknown:
         raise TrainingError(f"训练配置含未知顶层键: {sorted(unknown)}")
