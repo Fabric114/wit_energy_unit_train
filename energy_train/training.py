@@ -9,6 +9,7 @@ import math
 import subprocess
 import sys
 from dataclasses import dataclass
+from importlib import metadata
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from .common import PROJECT_ROOT, atomic_json, project_path, sha256, utc_now, va
 
 REQUIRED_ULTRALYTICS = "8.4.154"
 
-CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val", "cfg"})
+CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val", "cfg", "save"})
 OVERRIDE_KEYS = ("batch", "epochs", "device", "workers")
 TOP_LEVEL_KEYS = frozenset({"model", "train", "stages"})
 
@@ -98,8 +99,10 @@ def load_config(path):
     path = project_path(path).resolve()
     try:
         content = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise TrainingError(f"无法读取训练配置: {path}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TrainingError(f"无法读取训练配置（需为 UTF-8 文本）: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise TrainingError(f"训练配置 YAML 解析失败: {path}") from exc
     if not isinstance(content, dict):
         raise TrainingError("训练配置顶层必须是映射")
     try:
@@ -130,8 +133,8 @@ def load_config(path):
 def _read_yaml_mapping(path):
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise TrainingError(f"无法解析 data.yaml: {path}") from exc
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise TrainingError(f"无法解析 data.yaml（需为 UTF-8 YAML）: {path}") from exc
     if not isinstance(data, dict):
         raise TrainingError(f"data.yaml 顶层必须是映射: {path}")
     return data
@@ -168,6 +171,10 @@ def validate_dataset(data_yaml, datasets_root=None):
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             issues.append("summary.json 无法解析")
+        else:
+            if not isinstance(summary, dict):
+                issues.append("summary.json 顶层必须是对象")
+                summary = None
     if summary is not None:
         if summary.get("schema_version") != 2:
             issues.append(f"summary.json 的 schema_version 应为 2，当前为 {summary.get('schema_version')!r}")
@@ -184,8 +191,10 @@ def validate_dataset(data_yaml, datasets_root=None):
         issues.append(f"data.yaml 的 train 应为 images/train，当前为 {data.get('train')!r}")
     if data.get("val") != "images/val":
         issues.append(f"data.yaml 的 val 应为 images/val，当前为 {data.get('val')!r}")
-    if (dataset_dir / str(data.get("path"))).resolve() != dataset_dir.resolve():
-        issues.append(f"data.yaml 的 path 与数据集目录不符（{data.get('path')!r}），请更新 path 或重新构建")
+    declared = data.get("path")
+    if not isinstance(declared, str) or not Path(declared).is_absolute() \
+            or Path(declared).resolve() != dataset_dir.resolve():
+        issues.append(f"data.yaml 的 path 必须是等于数据集目录的绝对路径（当前为 {declared!r}），请更新 path 或重新构建")
 
     has_test = "test" in split_images
     if ("test" in data) != has_test:
@@ -206,6 +215,14 @@ def validate_dataset(data_yaml, datasets_root=None):
             issues.append(f"{split} 划分的 PNG 数量为 {images}，summary.json 记录 {expected}")
         if labels != expected:
             issues.append(f"{split} 划分的标签 txt 数量为 {labels}，summary.json 记录 {expected}")
+        image_dir, label_dir = dataset_dir / "images" / split, dataset_dir / "labels" / split
+        image_names = {p.relative_to(image_dir).with_suffix("") for p in image_dir.rglob("*.png")} \
+            if image_dir.is_dir() else set()
+        label_names = {p.relative_to(label_dir).with_suffix("") for p in label_dir.rglob("*.txt")} \
+            if label_dir.is_dir() else set()
+        if image_names != label_names:
+            issues.append(f"{split} 划分的图片与标签文件名不配对：缺标签 {len(image_names - label_names)} 个，"
+                          f"多余标签 {len(label_names - image_names)} 个")
 
     if issues:
         raise DatasetCheckError(issues)
@@ -247,7 +264,7 @@ def plan_run(config, dataset, *, runs_root=None, name=None, overrides=None):
         model = str(config.model) if previous is None else str(run_dir / previous / "weights" / "best.pt")
         args = {**stage.args, **shared,
                 "data": dataset["data_yaml"], "project": str(run_dir),
-                "name": stage.name, "exist_ok": False}
+                "name": stage.name, "exist_ok": False, "save": True}
         stages.append({"name": stage.name, "model": model, "args": args})
         previous = stage.name
     return {"run_name": name, "run_dir": str(run_dir), "stages": stages}
@@ -378,6 +395,7 @@ def _finish(provenance, run_dir, status, exc):
 def run_training(config, dataset, plan, *, overrides=None, command=None, yolo_cls=None,
                  env_info=environment_info, code_info=code_version):
     run_dir = Path(plan["run_dir"])
+    code = code_info()  # 先于建目录采集：失败时不留下空的 run 目录。
     # 占用目录放在 try 之外：目录已被别的运行占用时，不能覆盖它的 provenance。
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(exist_ok=False)
@@ -393,7 +411,7 @@ def run_training(config, dataset, plan, *, overrides=None, command=None, yolo_cl
         "cli_overrides": {key: value for key, value in (overrides or {}).items() if value is not None},
         "pretrained": {"path": str(config.model), "sha256": config.model_sha256},
         "dataset": dict(dataset),
-        "environment": {"code": code_info(), "energy_train_version": __version__},
+        "environment": {"code": code, "energy_train_version": __version__},
         "stages": [],
         "final_weights": None,
         "error": None,
@@ -428,12 +446,29 @@ def run_training(config, dataset, plan, *, overrides=None, command=None, yolo_cl
         raise
 
 
+def _report_run_failure(exc, provenance_path):
+    """目录已建且写有 provenance 时返回 1 并指向它；建目录前失败返回 2。"""
+    if provenance_path.exists():
+        print(f"训练失败: {exc}（详见 {provenance_path}）", file=sys.stderr)
+        return 1
+    print(f"训练失败: {exc}", file=sys.stderr)
+    return 2
+
+
 OVERRIDE_HELP = {
     "batch": "覆盖所有阶段的 batch（显存不足时用 8）",
     "epochs": "覆盖所有阶段的 epochs",
     "device": "训练设备，例如 0 或 cpu",
     "workers": "数据加载线程数",
 }
+
+
+def installed_ultralytics_version():
+    """只读包元数据，不导入 ultralytics 或 torch；未安装时返回 None。"""
+    try:
+        return metadata.version("ultralytics")
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def _build_parser():
@@ -467,10 +502,20 @@ def main(argv=None):
     except (TrainingError, FileExistsError, OSError, yaml.YAMLError) as exc:
         print(f"训练失败: {exc}", file=sys.stderr)
         return 2
+    installed = installed_ultralytics_version()
+    if installed is not None and installed != REQUIRED_ULTRALYTICS:
+        print(f"训练失败: ultralytics 版本必须是 {REQUIRED_ULTRALYTICS}，当前安装为 {installed}", file=sys.stderr)
+        return 2
+    if installed is None and not args.check_only:
+        print(f"训练失败: 未安装 ultralytics，请先安装 {REQUIRED_ULTRALYTICS}", file=sys.stderr)
+        return 2
     if args.check_only:
+        if installed is None:
+            print("提示: 当前环境未安装 ultralytics，真实训练前需要先安装", file=sys.stderr)
         print(json.dumps({"dataset": dataset, **plan}, ensure_ascii=False, indent=2))
         return 0
     run_dir = plan["run_dir"]
+    provenance_path = Path(run_dir) / "provenance.json"
     try:
         provenance = run_training(config, dataset, plan, overrides=overrides,
                                   command=["script/train.py", *raw_argv])
@@ -481,11 +526,9 @@ def main(argv=None):
         if exc.filename == run_dir:
             print(f"训练失败: {exc}", file=sys.stderr)
             return 2
-        print(f"训练失败: {exc}（详见 {run_dir}/provenance.json）", file=sys.stderr)
-        return 1
+        return _report_run_failure(exc, provenance_path)
     except Exception as exc:
-        print(f"训练失败: {exc}（详见 {run_dir}/provenance.json）", file=sys.stderr)
-        return 1
+        return _report_run_failure(exc, provenance_path)
     summary = {
         "run_dir": provenance["run_dir"],
         "status": provenance["status"],

@@ -156,6 +156,31 @@ class DatasetTests(unittest.TestCase):
                 self.assertTrue(any(("val" if keyword.startswith("val") else "train") in issue
                                     for issue in ctx.exception.issues), ctx.exception.issues)
 
+    def test_relative_path_is_rejected(self):
+        _edit_yaml(self.data, lambda d: d.update(path="."))
+        with self.assertRaises(DatasetCheckError) as ctx:
+            validate_dataset(self.data, self.datasets)
+        self.assertTrue(any("path" in issue for issue in ctx.exception.issues), ctx.exception.issues)
+
+    def test_images_and_labels_must_pair_by_name(self):
+        label = next((self.data.parent / "labels" / "train").rglob("*.txt"))
+        label.unlink()
+        (label.parent / "stray.txt").write_text("0 0.5 0.5 0.1 0.1\n", encoding="utf-8")
+        with self.assertRaises(DatasetCheckError) as ctx:
+            validate_dataset(self.data, self.datasets)
+        self.assertTrue(any("不配对" in issue for issue in ctx.exception.issues), ctx.exception.issues)
+
+    def test_non_object_summary_is_reported_not_crashed(self):
+        (self.data.parent / "summary.json").write_text("[]", encoding="utf-8")
+        with self.assertRaises(DatasetCheckError) as ctx:
+            validate_dataset(self.data, self.datasets)
+        self.assertTrue(any("summary.json" in issue for issue in ctx.exception.issues), ctx.exception.issues)
+
+    def test_non_utf8_data_yaml_is_a_training_error(self):
+        self.data.write_bytes(b"\xff\xfe\x00path")
+        with self.assertRaises(TrainingError):
+            validate_dataset(self.data, self.datasets)
+
     def test_reports_all_issues_together(self):
         _edit_yaml(self.data, lambda d: d.update(path=str(self.root / "elsewhere")))
         _edit_json(self.data.parent / "summary.json", lambda s: s.update(class_names={"0": "armor"}))
@@ -228,6 +253,16 @@ class ConfigTests(unittest.TestCase):
         path.write_text(f"model: {self.weight}\ntrain:\n  seed: .nan\n", encoding="utf-8")
         with self.assertRaises(TrainingError):
             load_config(path)
+
+    def test_non_utf8_config_is_a_training_error(self):
+        path = self.root / "bad.yaml"
+        path.write_bytes(b"\xff\xfe\x00model")
+        with self.assertRaises(TrainingError):
+            load_config(path)
+
+    def test_save_flag_is_controlled(self):
+        with self.assertRaises(TrainingError):
+            load_config(self.write({"model": str(self.weight), "train": {"save": False}}))
 
     def test_bare_model_name_is_not_downloaded(self):
         with self.assertRaises(TrainingError) as ctx:
@@ -447,6 +482,21 @@ class RunTests(unittest.TestCase):
                          env_info=lambda: dict(FAKE_ENV), code_info=lambda: FAKE_CODE)
         self.assertEqual(FakeYOLO.calls, [])
 
+    def test_plan_always_saves_weights(self):
+        plan = plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="sv")
+        self.assertIs(plan["stages"][0]["args"]["save"], True)
+
+    def test_code_info_failure_creates_no_run_dir(self):
+        plan = plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="ci")
+
+        def broken():
+            raise OSError("unreadable source")
+
+        with self.assertRaises(OSError):
+            run_training(self.cfg_single, self.dataset, plan, yolo_cls=FakeYOLO,
+                         env_info=lambda: dict(FAKE_ENV), code_info=broken)
+        self.assertFalse(Path(plan["run_dir"]).exists())
+
     def test_code_version_outside_git_and_in_empty_repo(self):
         if shutil.which("git") is None:
             self.skipTest("需要 git 命令")
@@ -480,6 +530,9 @@ class CliTests(unittest.TestCase):
         self.data = make_dataset(self.root)
         self.datasets = self.root / "datasets"
         self.runs = self.root / "runs"
+        patcher = mock.patch("energy_train.training.installed_ultralytics_version", return_value="8.4.154")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg_path = self.root / "cfg.yaml"
         self.cfg_path.write_text(yaml.safe_dump({"model": str(self.weight), **PlanTests.SINGLE},
                                                 allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -506,10 +559,28 @@ class CliTests(unittest.TestCase):
         self.assertIn("训练失败", bad.stderr)
 
     def test_main_maps_training_errors_to_exit_codes(self):
-        with mock.patch("energy_train.training.run_training", side_effect=RuntimeError("boom")):
+        def fail_after_provenance(config, dataset, plan, **kwargs):
+            Path(plan["run_dir"], "provenance.json").parent.mkdir(parents=True)
+            Path(plan["run_dir"], "provenance.json").write_text("{}", encoding="utf-8")
+            raise RuntimeError("boom")
+
+        with mock.patch("energy_train.training.run_training", side_effect=fail_after_provenance):
             self.assertEqual(main([*self.common_args(), "--name", "m1"]), 1)
         with mock.patch("energy_train.training.run_training", side_effect=KeyboardInterrupt):
             self.assertEqual(main([*self.common_args(), "--name", "m2"]), 130)
+
+    def test_main_checks_ultralytics_version_before_creating_run(self):
+        import io
+        from contextlib import redirect_stdout
+        with mock.patch("energy_train.training.installed_ultralytics_version", return_value="8.3.0"):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*self.common_args(), "--check-only"]), 2)
+            self.assertEqual(main([*self.common_args(), "--name", "v1"]), 2)
+        with mock.patch("energy_train.training.installed_ultralytics_version", return_value=None):
+            self.assertEqual(main([*self.common_args(), "--name", "v2"]), 2)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main([*self.common_args(), "--check-only"]), 0)
+        self.assertFalse(self.runs.exists())
 
 
 if __name__ == "__main__":
