@@ -1,9 +1,12 @@
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import yaml
@@ -12,8 +15,8 @@ from energy_train.capture import CaptureSession
 from energy_train.common import PROJECT_ROOT, sha256
 from energy_train.dataset import build_dataset
 from energy_train.training import (
-    CONTROLLED_KEYS, DatasetCheckError, TrainingError, default_run_name, load_config,
-    plan_run, validate_dataset,
+    CONTROLLED_KEYS, DatasetCheckError, TrainingError, code_version, default_run_name,
+    load_config, plan_run, run_training, validate_dataset,
 )
 
 
@@ -292,6 +295,166 @@ class PlanTests(unittest.TestCase):
     def test_invalid_name_rejected(self):
         with self.assertRaises(ValueError):
             plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="../escape")
+
+
+FAKE_ENV = {"python": "3.10.22", "platform": "linux", "hostname": "test", "ultralytics": "8.4.154",
+            "torch": "2.14.0+cu130", "torchvision": "0.29.0+cu130", "cuda": "13.0", "cudnn": 91000,
+            "gpus": [], "nvidia_driver": None}
+FAKE_CODE = {"git_commit": None, "git_dirty": None, "files": {}}
+
+
+class FakeYOLO:
+    """替身：不导入 ultralytics，在 project/name 下写 weights/best.pt 与 last.pt。"""
+    calls = []
+    fail_on = None
+    fail_with = RuntimeError
+    save_suffix = ""
+    skip_best = False
+    seen_status = []
+
+    def __init__(self, model):
+        self.model = model
+
+    def train(self, **kw):
+        FakeYOLO.calls.append((self.model, kw))
+        FakeYOLO.seen_status.append(
+            json.loads((Path(kw["project"]) / "provenance.json").read_text(encoding="utf-8"))["status"])
+        if kw["name"] == FakeYOLO.fail_on:
+            raise FakeYOLO.fail_with("boom")
+        save = Path(kw["project"]) / (kw["name"] + FakeYOLO.save_suffix)
+        (save / "weights").mkdir(parents=True)
+        best, last = save / "weights/best.pt", save / "weights/last.pt"
+        if not FakeYOLO.skip_best:
+            best.write_bytes(b"best-" + kw["name"].encode())
+        last.write_bytes(b"last")
+        self.trainer = SimpleNamespace(save_dir=save, best=best, last=last, metrics={
+            "metrics/mAP50(B)": 0.9, "metrics/mAP50-95(B)": 0.7,
+            "metrics/precision(B)": 0.8, "metrics/recall(B)": 0.85, "bad": float("nan")})
+
+
+class RunTests(unittest.TestCase):
+    def setUp(self):
+        FakeYOLO.calls = []
+        FakeYOLO.fail_on = None
+        FakeYOLO.fail_with = RuntimeError
+        FakeYOLO.save_suffix = ""
+        FakeYOLO.skip_best = False
+        FakeYOLO.seen_status = []
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.weight = self.root / "w.pt"
+        self.weight.write_bytes(b"fake-weights")
+        self.runs = self.root / "runs"
+        self.dataset = validate_dataset(make_dataset(self.root), self.root / "datasets")
+        self.cfg_single = load_config(self.write("single.yaml", PlanTests.SINGLE))
+        self.cfg_two = load_config(self.write("two.yaml", PlanTests.TWO))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, template):
+        content = {"model": str(self.weight), **template}
+        path = self.root / name
+        path.write_text(yaml.safe_dump(content, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        return path
+
+    def run_it(self, cfg, *, name="run", overrides=None, command=None):
+        plan = plan_run(cfg, self.dataset, runs_root=self.runs, name=name, overrides=overrides)
+        return run_training(cfg, self.dataset, plan, overrides=overrides, command=command,
+                            yolo_cls=FakeYOLO, env_info=lambda: dict(FAKE_ENV), code_info=lambda: FAKE_CODE)
+
+    def saved_provenance(self, name="run"):
+        return json.loads((self.runs / name / "provenance.json").read_text(encoding="utf-8"))
+
+    def test_single_stage_completed_provenance(self):
+        prov = self.run_it(self.cfg_single, overrides={"batch": 8}, command=["script/train.py"])
+        saved = self.saved_provenance()
+        self.assertEqual(saved, prov)
+        self.assertEqual(prov["status"], "completed")
+        self.assertEqual(FakeYOLO.seen_status, ["running"])
+        self.assertEqual(prov["cli_overrides"], {"batch": 8})
+        self.assertEqual(prov["pretrained"]["sha256"], self.cfg_single.model_sha256)
+        self.assertEqual(prov["config"]["sha256"], self.cfg_single.sha256)
+        self.assertEqual(prov["dataset"], self.dataset)
+        self.assertEqual(prov["environment"]["ultralytics"], "8.4.154")
+        self.assertEqual(prov["environment"]["code"], FAKE_CODE)
+        stage = prov["stages"][0]
+        self.assertEqual(stage["best_sha256"], sha256(stage["best"]))
+        self.assertNotIn("bad", stage["metrics"])
+        self.assertEqual(stage["metrics"]["metrics/mAP50(B)"], 0.9)
+        self.assertEqual(prov["final_weights"], stage["best"])
+        self.assertIsNotNone(prov["finished_at"])
+
+    def test_two_stage_uses_stage1_best(self):
+        prov = self.run_it(self.cfg_two)
+        self.assertEqual(FakeYOLO.calls[1][0], prov["stages"][0]["best"])
+        self.assertEqual(prov["final_weights"], prov["stages"][1]["best"])
+
+    def test_stage1_failure_skips_stage2(self):
+        FakeYOLO.fail_on = "stage1_freeze"
+        with self.assertRaises(RuntimeError):
+            self.run_it(self.cfg_two)
+        self.assertEqual(len(FakeYOLO.calls), 1)
+        self.assertEqual(self.saved_provenance()["status"], "failed")
+        self.assertIn("boom", self.saved_provenance()["error"]["message"])
+
+    def test_keyboard_interrupt_marks_interrupted(self):
+        FakeYOLO.fail_on, FakeYOLO.fail_with = "train", KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_it(self.cfg_single)
+        self.assertEqual(self.saved_provenance()["status"], "interrupted")
+
+    def test_missing_best_stops_next_stage(self):
+        FakeYOLO.skip_best = True
+        with self.assertRaises(TrainingError):
+            self.run_it(self.cfg_two)
+        self.assertEqual(len(FakeYOLO.calls), 1)
+        self.assertEqual(self.saved_provenance()["status"], "failed")
+
+    def test_renamed_save_dir_rejected(self):
+        FakeYOLO.save_suffix = "2"
+        with self.assertRaises(TrainingError):
+            self.run_it(self.cfg_single)
+
+    def test_wrong_ultralytics_version_fails_before_training(self):
+        env = dict(FAKE_ENV, ultralytics="8.3.0")
+        plan = plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="v")
+        with self.assertRaises(TrainingError):
+            run_training(self.cfg_single, self.dataset, plan, yolo_cls=FakeYOLO,
+                         env_info=lambda: env, code_info=lambda: FAKE_CODE)
+        self.assertEqual(FakeYOLO.calls, [])
+        self.assertEqual(self.saved_provenance("v")["status"], "failed")
+
+    def test_run_dir_claimed_concurrently(self):
+        plan = plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="race")
+        Path(plan["run_dir"]).mkdir(parents=True)
+        with self.assertRaises(FileExistsError):
+            run_training(self.cfg_single, self.dataset, plan, yolo_cls=FakeYOLO,
+                         env_info=lambda: dict(FAKE_ENV), code_info=lambda: FAKE_CODE)
+        self.assertEqual(FakeYOLO.calls, [])
+
+    def test_code_version_outside_git_and_in_empty_repo(self):
+        if shutil.which("git") is None:
+            self.skipTest("需要 git 命令")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "energy_train").mkdir()
+            (root / "energy_train" / "x.py").write_text("x = 1\n", encoding="utf-8")
+            info = code_version(root)
+            self.assertIsNone(info["git_commit"])
+            self.assertIsNone(info["git_dirty"])
+            self.assertIn("energy_train/x.py", info["files"])
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            info = code_version(root)
+            self.assertIsNone(info["git_commit"])
+            self.assertIsInstance(info["git_dirty"], bool)
+            self.assertIn("energy_train/x.py", info["files"])
+
+    def test_import_does_not_load_ultralytics(self):
+        out = subprocess.run([sys.executable, "-c", "import sys, energy_train.training; "
+                              "print(any(m in sys.modules for m in ('ultralytics', 'torch')))"],
+                             cwd=PROJECT_ROOT, capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), "False")
 
 
 if __name__ == "__main__":

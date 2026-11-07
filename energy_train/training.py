@@ -4,13 +4,18 @@
 """
 
 import json
+import math
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
-from .common import PROJECT_ROOT, project_path, sha256, valid_name
+from . import __version__
+from .common import PROJECT_ROOT, atomic_json, project_path, sha256, utc_now, valid_name
+
+REQUIRED_ULTRALYTICS = "8.4.154"
 
 CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val"})
 OVERRIDE_KEYS = ("batch", "epochs", "device", "workers")
@@ -240,3 +245,178 @@ def plan_run(config, dataset, *, runs_root=None, name=None, overrides=None):
         stages.append({"name": stage.name, "model": model, "args": args})
         previous = stage.name
     return {"run_name": name, "run_dir": str(run_dir), "stages": stages}
+
+
+def _git(root, *args):
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def code_version(project_root=PROJECT_ROOT):
+    root = Path(project_root)
+    commit = _git(root, "rev-parse", "HEAD")
+    status = _git(root, "status", "--porcelain")
+    files = {}
+    for path in sorted([*root.glob("energy_train/*.py"), root / "script" / "train.py"]):
+        if path.is_file():
+            files[path.relative_to(root).as_posix()] = sha256(path)
+    return {
+        "git_commit": (commit or "").strip() or None,
+        "git_dirty": None if status is None else bool(status.strip()),
+        "files": files,
+    }
+
+
+def _nvidia_driver():
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.strip().splitlines()
+    return lines[0].strip() if lines else None
+
+
+def environment_info():
+    import platform
+    import socket
+    import sys
+
+    import torch
+    import torchvision
+    import ultralytics
+
+    gpus = []
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(index)
+            gpus.append({
+                "index": index,
+                "name": props.name,
+                "total_memory_mib": props.total_memory // (1024 * 1024),
+                "capability": f"{props.major}.{props.minor}",
+            })
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "ultralytics": ultralytics.__version__,
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "gpus": gpus,
+        "nvidia_driver": _nvidia_driver(),
+    }
+
+
+def _relative(path):
+    path = Path(path).resolve()
+    try:
+        return path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _finite_metrics(metrics):
+    out = {}
+    for key, value in (metrics or {}).items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            out[str(key)] = number
+    return out
+
+
+def _stage_record(model, stage, run_dir):
+    trainer = model.trainer
+    save_dir = Path(trainer.save_dir).resolve()
+    expected = (run_dir / stage["name"]).resolve()
+    if save_dir != expected:
+        raise TrainingError(
+            f"阶段 {stage['name']} 的输出目录为 {save_dir}，与预期 {expected} 不符（ultralytics 可能改了目录名）"
+        )
+    best, last = Path(trainer.best), Path(trainer.last)
+    if not best.is_file():
+        raise TrainingError(f"阶段 {stage['name']} 结束后找不到 best.pt: {best}")
+    return {
+        "name": stage["name"],
+        "model": stage["model"],
+        "model_sha256": sha256(stage["model"]),
+        "args": stage["args"],
+        "save_dir": str(save_dir),
+        "best": str(best),
+        "best_sha256": sha256(best),
+        "last": str(last) if last.is_file() else None,
+        "last_sha256": sha256(last) if last.is_file() else None,
+        "metrics": _finite_metrics(trainer.metrics),
+        "status": "completed",
+    }
+
+
+def _finish(provenance, run_dir, status, exc):
+    provenance["status"] = status
+    provenance["finished_at"] = utc_now()
+    provenance["error"] = {"type": type(exc).__name__, "message": str(exc)}
+    atomic_json(run_dir / "provenance.json", provenance)
+
+
+def run_training(config, dataset, plan, *, overrides=None, command=None, yolo_cls=None,
+                 env_info=environment_info, code_info=code_version):
+    run_dir = Path(plan["run_dir"])
+    # 占用目录放在 try 之外：目录已被别的运行占用时，不能覆盖它的 provenance。
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(exist_ok=False)
+    provenance = {
+        "schema_version": 1,
+        "status": "running",
+        "run_name": plan["run_name"],
+        "run_dir": str(run_dir),
+        "started_at": utc_now(),
+        "finished_at": None,
+        "command": list(command or []),
+        "config": {"path": _relative(config.path), "sha256": config.sha256, "content": config.content},
+        "cli_overrides": {key: value for key, value in (overrides or {}).items() if value is not None},
+        "pretrained": {"path": str(config.model), "sha256": config.model_sha256},
+        "dataset": dict(dataset),
+        "environment": {"code": code_info(), "energy_train_version": __version__},
+        "stages": [],
+        "final_weights": None,
+        "error": None,
+    }
+    atomic_json(run_dir / "provenance.json", provenance)
+    try:
+        info = env_info()
+        if info.get("ultralytics") != REQUIRED_ULTRALYTICS:
+            raise TrainingError(
+                f"ultralytics 版本必须是 {REQUIRED_ULTRALYTICS}，当前为 {info.get('ultralytics')}"
+            )
+        provenance["environment"].update(info)
+        atomic_json(run_dir / "provenance.json", provenance)
+        if yolo_cls is None:
+            from ultralytics import YOLO
+            yolo_cls = YOLO
+        for stage in plan["stages"]:
+            model = yolo_cls(stage["model"])
+            model.train(**stage["args"])
+            provenance["stages"].append(_stage_record(model, stage, run_dir))
+            atomic_json(run_dir / "provenance.json", provenance)
+        provenance["final_weights"] = provenance["stages"][-1]["best"]
+        provenance["status"] = "completed"
+        provenance["finished_at"] = utc_now()
+        atomic_json(run_dir / "provenance.json", provenance)
+        return provenance
+    except KeyboardInterrupt as exc:
+        _finish(provenance, run_dir, "interrupted", exc)
+        raise
+    except Exception as exc:
+        _finish(provenance, run_dir, "failed", exc)
+        raise
