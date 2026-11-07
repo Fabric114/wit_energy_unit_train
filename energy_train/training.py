@@ -5,6 +5,7 @@
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -12,6 +13,7 @@ import yaml
 from .common import PROJECT_ROOT, project_path, sha256, valid_name
 
 CONTROLLED_KEYS = frozenset({"data", "model", "project", "name", "exist_ok", "resume", "val"})
+OVERRIDE_KEYS = ("batch", "epochs", "device", "workers")
 TOP_LEVEL_KEYS = frozenset({"model", "train", "stages"})
 
 
@@ -206,3 +208,35 @@ def validate_dataset(data_yaml, datasets_root=None):
         "group_splits": dict(summary.get("group_splits", {})),
         "has_test": has_test,
     }
+
+
+def default_run_name(config_path, dataset_dir, now=None):
+    if now is None:
+        now = datetime.now()
+    return f"{Path(config_path).stem}_{Path(dataset_dir).name}_{now:%Y%m%d-%H%M%S}"
+
+
+def plan_run(config, dataset, *, runs_root=None, name=None, overrides=None):
+    """纯计算：给出 run 目录和每阶段参数，不创建任何目录。"""
+    root = (PROJECT_ROOT / "runs") if runs_root is None else project_path(runs_root)
+    root = root.resolve()
+    if name is None:
+        name = default_run_name(config.path, Path(dataset["dataset_dir"]))
+    try:
+        valid_name(name)
+    except ValueError as exc:
+        raise TrainingError(f"运行名不合法: {name!r}，仅允许字母、数字、下划线和短横线") from exc
+    run_dir = root / name
+    if run_dir.exists():
+        raise TrainingError(f"运行目录已存在，请换一个 --name: {run_dir}")
+    shared = {key: value for key, value in (overrides or {}).items()
+              if key in OVERRIDE_KEYS and value is not None}
+    stages, previous = [], None
+    for stage in config.stages:
+        model = str(config.model) if previous is None else str(run_dir / previous / "weights" / "best.pt")
+        args = {**stage.args, **shared,
+                "data": dataset["data_yaml"], "project": str(run_dir),
+                "name": stage.name, "exist_ok": False}
+        stages.append({"name": stage.name, "model": model, "args": args})
+        previous = stage.name
+    return {"run_name": name, "run_dir": str(run_dir), "stages": stages}

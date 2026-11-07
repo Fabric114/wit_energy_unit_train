@@ -2,6 +2,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,8 @@ from energy_train.capture import CaptureSession
 from energy_train.common import PROJECT_ROOT, sha256
 from energy_train.dataset import build_dataset
 from energy_train.training import (
-    CONTROLLED_KEYS, DatasetCheckError, TrainingError, load_config, validate_dataset,
+    CONTROLLED_KEYS, DatasetCheckError, TrainingError, default_run_name, load_config,
+    plan_run, validate_dataset,
 )
 
 
@@ -158,10 +160,6 @@ class DatasetTests(unittest.TestCase):
         self.assertGreaterEqual(len(ctx.exception.issues), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -226,6 +224,74 @@ class ConfigTests(unittest.TestCase):
         two = yaml.safe_load((PROJECT_ROOT / "configs/train/yolo11n_two_stage.yaml").read_text(encoding="utf-8"))
         self.assertEqual([s["name"] for s in two["stages"]], ["stage1_freeze", "stage2_finetune"])
         self.assertEqual(two["stages"][1]["optimizer"], "AdamW")
+
+
+class PlanTests(unittest.TestCase):
+    SINGLE = {"train": {"epochs": 150, "batch": 16}}
+    TWO = {"train": {"batch": 16, "imgsz": 640, "degrees": 10, "patience": 30, "seed": 42},
+           "stages": [{"name": "stage1_freeze", "epochs": 20, "freeze": 10},
+                      {"name": "stage2_finetune", "epochs": 30, "optimizer": "AdamW", "lr0": 0.001}]}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.weight = self.root / "w.pt"
+        self.weight.write_bytes(b"fake-weights")
+        self.runs = self.root / "runs"
+        self.dataset = validate_dataset(make_dataset(self.root), self.root / "datasets")
+        self.cfg_single = load_config(self.write("single.yaml", self.SINGLE))
+        self.cfg_two = load_config(self.write("two.yaml", self.TWO))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name, template):
+        content = {"model": str(self.weight), **template}
+        path = self.root / name
+        path.write_text(yaml.safe_dump(content, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        return path
+
+    def test_default_run_name(self):
+        name = default_run_name(Path("configs/train/yolo11n.yaml"), Path("datasets/energy_v1"),
+                                datetime(2026, 11, 7, 20, 30, 0))
+        self.assertEqual(name, "yolo11n_energy_v1_20261107-203000")
+
+    def test_single_stage_args(self):
+        plan = plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="r1", overrides={"batch": 8})
+        stage = plan["stages"][0]
+        self.assertEqual(plan["run_dir"], str((self.runs / "r1").resolve()))
+        self.assertEqual(stage["name"], "train")
+        self.assertEqual(stage["model"], str(self.cfg_single.model))
+        self.assertEqual(stage["args"]["data"], self.dataset["data_yaml"])
+        self.assertEqual(stage["args"]["project"], plan["run_dir"])
+        self.assertEqual(stage["args"]["name"], "train")
+        self.assertIs(stage["args"]["exist_ok"], False)
+        self.assertEqual(stage["args"]["batch"], 8)
+        self.assertEqual(stage["args"]["epochs"], 150)
+        self.assertTrue(Path(stage["args"]["data"]).is_absolute())
+        json.dumps(plan)
+
+    def test_two_stage_chains_best_and_overrides_apply_to_all(self):
+        plan = plan_run(self.cfg_two, self.dataset, runs_root=self.runs, name="r2", overrides={"epochs": 1})
+        s1, s2 = plan["stages"]
+        self.assertEqual(s1["model"], str(self.cfg_two.model))
+        self.assertEqual(s2["model"], str(Path(plan["run_dir"]) / "stage1_freeze" / "weights" / "best.pt"))
+        self.assertEqual((s1["args"]["epochs"], s2["args"]["epochs"]), (1, 1))
+        self.assertEqual(s1["args"]["freeze"], 10)
+        self.assertNotIn("freeze", s2["args"])
+        self.assertEqual(s2["args"]["lr0"], 0.001)
+
+    def test_existing_run_dir_rejected_and_nothing_created(self):
+        (self.runs / "taken").mkdir(parents=True)
+        with self.assertRaises(TrainingError):
+            plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="taken")
+        fresh = self.root / "fresh_runs"
+        plan_run(self.cfg_single, self.dataset, runs_root=fresh, name="x")
+        self.assertFalse(fresh.exists())
+
+    def test_invalid_name_rejected(self):
+        with self.assertRaises(ValueError):
+            plan_run(self.cfg_single, self.dataset, runs_root=self.runs, name="../escape")
 
 
 if __name__ == "__main__":
