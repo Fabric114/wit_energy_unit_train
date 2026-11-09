@@ -1,0 +1,18 @@
+# 示例文件：图片名均为虚构，仅演示结构，不对应真实采集。
+# 真实分组请用 script/propose_groups.py 生成草稿，人工核对后再使用，不要直接套用本文件。
+schema_version: 1
+confirmed: false
+groups:
+  - id: example_a
+    reason: 示例：同一布置下的连续取件过程
+    ranges:
+      - {from: s01/s01_00001.png, to: s01/s01_00304.png}
+  - id: example_b
+    scene: example_a
+    reason: 示例：长场景细分块，与 example_a 为同一场景
+    images: [s02/s02_00160.png]
+exclude:
+  - reason: 示例：细分缓冲
+    images: [s02/s02_00151.png]
+tags:
+  s01/s01_00001.png: [blur, occlusion]
