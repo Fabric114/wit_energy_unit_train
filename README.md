@@ -12,6 +12,9 @@
 │   ├── capture.py                 //采集图像（目前仅d435）
 │   ├── common.py                  //通用
 │   ├── dataset.py                 //数据集检查、划分、构建
+│   ├── group_proposal.py          //按时间断点生成分组草稿
+│   ├── snapshot.py                //已发布快照校验（训练共用）
+│   ├── splitting.py               //场景份、group-file、份分配
 │   └── training.py                //训练配置校验、provenance 记录
 ├── environment.yml                //conda 环境 wit_energy_unit
 ├── raw                            //采集的数据
@@ -25,6 +28,7 @@
 │   ├── build_dataset.py
 │   ├── capture_d435.py
 │   ├── doctor.py
+│   ├── propose_groups.py
 │   ├── prelabel_openvino.py
 │   ├── render_annotations.py
 │   └── train.py
@@ -50,6 +54,12 @@ python script/prelabel_openvino.py --session s03
 
 # 校验标注并检查划分可行性
 python script/build_dataset.py --check-only
+
+# 可选：按拍摄间隔生成分组草稿（只读 raw，confirmed: false，需人工看图核对）
+python script/propose_groups.py --output configs/dataset/groups.yaml
+# 核对后把 groups.yaml 中的 confirmed 改为 true，再检查和构建
+python script/build_dataset.py --group-file configs/dataset/groups.yaml --check-only
+python script/build_dataset.py --group-file configs/dataset/groups.yaml --output datasets/energy_v2
 
 # 构建 YOLO 数据集，输出必须是新目录
 python script/build_dataset.py --output datasets/energy_v1
