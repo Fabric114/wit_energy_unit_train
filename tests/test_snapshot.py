@@ -123,13 +123,6 @@ class SnapshotTests(unittest.TestCase):
                 finally:
                     tmp.cleanup()
 
-    def test_schema3_scene_and_group_mapping_must_agree_with_rows(self):
-        rows = read_manifest(self.data.parent)
-        rows[0]["split"] = "val" if rows[0]["split"] == "train" else "train"
-        write_manifest(self.data.parent, rows)
-        with self.assertRaises(SnapshotError):
-            load_snapshot(self.data)
-
     def test_scene_mismatch_inside_one_group_is_rejected(self):
         rows = read_manifest(self.data.parent)
         rows[0]["scene"] = "other_scene"

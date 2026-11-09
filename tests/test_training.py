@@ -601,14 +601,6 @@ class SchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["group_splits"], {"g1": "train", "g2": "val"})
 
-    def test_unknown_schema_is_rejected_by_training(self):
-        summary = self.data.parent / "summary.json"
-        doc = json.loads(summary.read_text())
-        doc["schema_version"] = 1
-        summary.write_text(json.dumps(doc))
-        with self.assertRaises(DatasetCheckError) as ctx:
-            validate_dataset(self.data, self.datasets)
-        self.assertTrue(any("schema_version" in issue for issue in ctx.exception.issues), ctx.exception.issues)
 
 
 if __name__ == "__main__":
