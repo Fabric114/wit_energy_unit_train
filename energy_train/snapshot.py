@@ -10,11 +10,13 @@ import yaml
 
 from .common import sha256
 
-SUPPORTED_SCHEMAS = (2, 3)
+SUPPORTED_SCHEMAS = (2, 3, 4)
 SPLITS = ("train", "val", "test")
 EPSILON = 1e-6
 MANIFEST_KEYS = {"split", "image", "label", "image_sha256", "label_sha256", "bboxes",
                  "width", "height", "instances", "group_id"}
+KINDS = ("original", "augmentation")
+RESERVED_DIR = "__aug__"
 
 
 class SnapshotError(ValueError):
@@ -137,7 +139,7 @@ def load_snapshot(data_yaml):
         raise SnapshotError(issues + ["summary.json 顶层必须是对象"])
     schema = summary.get("schema_version")
     if type(schema) is not int or schema not in SUPPORTED_SCHEMAS:
-        raise SnapshotError(issues + [f"不支持的 schema_version: {schema!r}，仅支持 2 与 3"])
+        raise SnapshotError(issues + [f"不支持的 schema_version: {schema!r}，仅支持 2、3 与 4"])
     if summary.get("class_names") != {"0": "energy_unit"}:
         issues.append(f"summary.json 的 class_names 应为 {{'0': 'energy_unit'}}，当前为 {summary.get('class_names')!r}")
     if data.get("names") not in ({0: "energy_unit"}, ["energy_unit"]):
@@ -177,7 +179,9 @@ def load_snapshot(data_yaml):
             rows.append(row)
         else:
             issues.append(f"manifest.jsonl 第 {number} 行必须是对象")
-    required = MANIFEST_KEYS | ({"split_group_id", "scene"} if schema == 3 else set())
+    required = MANIFEST_KEYS | ({"split_group_id", "scene"} if schema >= 3 else set())
+    if schema == 4:
+        required = required | {"kind", "status"}
     counts = {split: 0 for split in SPLITS}
     owner_splits, image_splits, scenes, present, paths = {}, {}, {}, set(), set()
     valid = []
@@ -186,6 +190,9 @@ def load_snapshot(data_yaml):
         missing = required - set(row)
         if missing:
             issues.append(f"{where} 缺少字段 {sorted(missing)}")
+            continue
+        if schema < 4 and "kind" in row:
+            issues.append(f"{where} 的 kind 字段仅 schema 4 允许")
             continue
         split, image_rel, label_rel = row["split"], row["image"], row["label"]
         if split not in SPLITS:
@@ -199,8 +206,8 @@ def load_snapshot(data_yaml):
             issues.append(f"{where} 图片重复: {image_rel}")
             continue
         paths.add(image_rel)
-        key = row["split_group_id"] if schema == 3 else row["group_id"]
-        if schema == 3:
+        key = row["split_group_id"] if schema >= 3 else row["group_id"]
+        if schema >= 3:
             scenes.setdefault(key, set()).add(row["scene"])
         if group_splits.get(key) != split:
             issues.append(f"{where} 的份 {key!r} 与 summary.group_splits 不一致")
@@ -252,6 +259,8 @@ def load_snapshot(data_yaml):
         actual = _label_boxes(label_payload, row["label"], issues)
         if actual is not None and not _same_boxes(actual, _expected_yolo(bboxes, width, height)):
             issues.append(f"{row['label']} 与清单中的框不一致")
+    if schema == 4:
+        _check_derived(summary, valid, issues)
     listed = {row["image"] for _, row in valid} | {row["label"] for _, row in valid}
     extra = sorted(set(_snapshot_files(dataset_dir)) - listed)
     if extra:
@@ -262,6 +271,62 @@ def load_snapshot(data_yaml):
         root=dataset_dir, data=data, summary=summary, rows=[row for _, row in valid], hashes=hashes,
         image_paths=tuple(sorted(row["image"] for _, row in valid)),
         label_paths=tuple(sorted(row["label"] for _, row in valid)))
+
+
+def _check_derived(summary, rows, issues):
+    """schema 4：校验 kind、原图与副本位置、父图追溯、base 摘要和衍生统计。rows 为 (key, row) 列表。"""
+    if summary.get("dataset_kind") != "augmented":
+        issues.append("schema 4 的 dataset_kind 必须为 augmented")
+    base = summary.get("base_dataset")
+    base_files = base.get("files_sha256") if isinstance(base, dict) else None
+    if not isinstance(base_files, dict):
+        issues.append("schema 4 的 summary.json 缺少 base_dataset.files_sha256")
+        base_files = {}
+    augmentation = summary.get("augmentation")
+    if not isinstance(augmentation, dict):
+        issues.append("schema 4 的 summary.json 缺少 augmentation")
+        augmentation = {}
+    originals, augmented = {}, []
+    for _, row in rows:
+        kind = row["kind"]
+        if kind not in KINDS:
+            issues.append(f"{row['image']} 的 kind 非法: {kind!r}")
+        elif kind == "original":
+            if RESERVED_DIR in Path(row["image"]).parts:
+                issues.append(f"{row['image']} 为原图行，不能位于保留目录 {RESERVED_DIR} 中")
+            if row.get("status") != "passed":
+                issues.append(f"{row['image']} 为原图行，status 必须为 passed")
+            if base_files.get(row["image"]) != row["image_sha256"] \
+                    or base_files.get(row["label"]) != row["label_sha256"]:
+                issues.append(f"{row['image']} 与 base_dataset.files_sha256 不一致")
+            originals[row["image"]] = row
+        else:
+            augmented.append(row)
+    for row in augmented:
+        where = row["image"]
+        if RESERVED_DIR not in Path(where).parts:
+            issues.append(f"{where} 为增强行，必须位于保留目录 {RESERVED_DIR} 中")
+        if row["split"] != "train":
+            issues.append(f"{where} 为增强行，只能位于 train")
+        if row.get("status") != "generated":
+            issues.append(f"{where} 为增强行，status 必须为 generated")
+        parent = originals.get(row.get("parent_image"))
+        if parent is None or parent["split"] != "train":
+            issues.append(f"{where} 的父图 {row.get('parent_image')!r} 不是本快照中的 train 原图")
+            continue
+        pairs = (("parent_image_sha256", "image_sha256"), ("parent_label_sha256", "label_sha256"),
+                 ("group_id", "group_id"), ("split_group_id", "split_group_id"), ("scene", "scene"))
+        for own, theirs in pairs:
+            if row.get(own) != parent.get(theirs):
+                issues.append(f"{where} 的 {own} 与父图 {theirs} 不一致")
+    if augmentation.get("generated") != len(augmented):
+        issues.append(f"augmentation.generated 为 {augmentation.get('generated')!r}，清单中有 {len(augmented)} 条增强行")
+    boxes = [row["bboxes"] for _, row in rows if isinstance(row.get("bboxes"), list)]
+    if summary.get("instances") != sum(len(b) for b in boxes):
+        issues.append("summary.json 的 instances 与清单框数不一致")
+    positive = sum(1 for b in boxes if b)
+    if summary.get("positive") != positive or summary.get("negative") != len(rows) - positive:
+        issues.append("summary.json 的 positive/negative 与清单不一致")
 
 
 def _valid_box(box, width, height):
