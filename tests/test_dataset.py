@@ -13,7 +13,7 @@ import yaml
 
 from energy_train.capture import CaptureSession
 from energy_train.common import sha256
-from energy_train.dataset import inspect_dataset, assign_groups, build_dataset
+from energy_train.dataset import inspect_dataset, assign_groups, build_dataset, prepare_dataset
 
 
 class DatasetTests(unittest.TestCase):
@@ -200,6 +200,113 @@ class DatasetTests(unittest.TestCase):
         pending = subprocess.run(base + ["--check-only"], cwd=self.root, capture_output=True, text=True)
         self.assertEqual(pending.returncode, 2)
         self.assertEqual(json.loads(pending.stdout)["summary"]["pending"], 1)
+
+    def group_text(self, confirmed=True, exclude=""):
+        a, b, c, d = self.ids()
+        return (f"schema_version: 1\nconfirmed: {str(confirmed).lower()}\ngroups:\n"
+                f"  - {{id: first, reason: 第一段, images: [{a}, {b}]}}\n"
+                f"  - {{id: second, reason: 第二段, images: [{c}, {d}]}}\n" + exclude)
+
+    def ids(self):
+        return [f"{p.parent.name}/{p.name}" for p in self.images]
+
+    def group_file(self, text):
+        path = self.root / "groups.yaml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def manifest(self, output):
+        return [json.loads(line) for line in (output / "manifest.jsonl").read_text().splitlines()]
+
+    def test_publish_is_schema3_with_algorithm_stats_and_reusable_splits_file(self):
+        result = build_dataset(self.raw, self.output)
+        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["algorithm"], "shuffled_groups_v1")
+        self.assertEqual(result["split_method"], "shuffled_groups_v1")
+        self.assertEqual(set(result["group_splits"]), {"g1", "g2"})
+        self.assertEqual(result["group_definition"]["mode"], "meta")
+        self.assertIn("split_stats", result)
+        self.assertIsInstance(result["warnings"], list)
+        saved = yaml.safe_load((self.output / "splits.yaml").read_text())
+        self.assertEqual({g: s for s, groups in saved.items() for g in groups}, result["group_splits"])
+        self.assertEqual(prepare_dataset(self.raw).assignment, result["group_splits"])
+
+    def test_group_file_splits_one_session_and_joins_groups_across_sessions(self):
+        a, b, c, d = self.ids()
+        path = self.group_file(self.group_text())
+        result = build_dataset(self.raw, self.output, group_file=path)
+        rows = {Path(r["source_image"]).name: r for r in self.manifest(self.output)}
+        self.assertEqual(rows[Path(b).name]["split_group_id"], "first")
+        self.assertEqual(rows[Path(c).name]["split_group_id"], "second")
+        self.assertEqual(rows[Path(b).name]["group_id"], "g1")
+        self.assertEqual(rows[Path(c).name]["group_id"], "g2")
+        self.assertEqual(rows[Path(c).name]["scene"], "second")
+        self.assertEqual(result["group_definition"]["confirmed"], True)
+        for name in {r["split_group_id"] for r in rows.values()}:
+            self.assertEqual(len({r["split"] for r in rows.values() if r["split_group_id"] == name}), 1)
+
+    def test_excluded_image_leaves_snapshot_but_still_needs_passed_review(self):
+        a, b, c, d = self.ids()
+        exclude = f"exclude:\n  - {{reason: 边界模糊, images: [{b}]}}\n"
+        text = (f"schema_version: 1\nconfirmed: true\ngroups:\n"
+                f"  - {{id: first, reason: 第一段, images: [{a}]}}\n"
+                f"  - {{id: second, reason: 第二段, images: [{c}, {d}]}}\n" + exclude)
+        result = build_dataset(self.raw, self.output, group_file=self.group_file(text))
+        self.assertEqual(result["images"], 4)
+        self.assertEqual(result["excluded_images"], 1)
+        self.assertEqual(sum(result["split_images"].values()), 3)
+        self.assertNotIn(Path(b).name, {Path(r["source_image"]).name for r in self.manifest(self.output)})
+        self.assertEqual(result["group_definition"]["exclude"][0]["image"], b)
+        doc = json.loads(self.images[1].with_suffix(".json").read_text())
+        doc["checked"] = "failed"
+        self.images[1].with_suffix(".json").write_text(json.dumps(doc))
+        with self.assertRaises(ValueError):
+            build_dataset(self.raw, self.output.parent / "again", group_file=self.group_file(text))
+
+    def test_unconfirmed_group_file_is_reported_and_never_built(self):
+        path = self.group_file(self.group_text(confirmed=False))
+        prepared = prepare_dataset(self.raw, group_file=path)
+        self.assertIn("group_file_unconfirmed", [w["code"] for w in prepared.warnings])
+        self.assertFalse(prepared.group_definition["confirmed"])
+        with self.assertRaisesRegex(ValueError, "confirmed"):
+            build_dataset(self.raw, self.output, group_file=path)
+        self.assertFalse(self.output.exists())
+
+    def test_group_file_changed_during_copy_never_publishes(self):
+        text = self.group_text()
+        path = self.group_file(text)
+        real_copy = shutil.copyfile
+
+        def copy_then_edit(source, destination):
+            result = real_copy(source, destination)
+            path.write_text(text + "# edited\n", encoding="utf-8")
+            return result
+
+        with patch("energy_train.dataset.shutil.copyfile", side_effect=copy_then_edit):
+            with self.assertRaisesRegex(ValueError, "被修改"):
+                build_dataset(self.raw, self.output, group_file=path)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(list(self.root.glob(".dataset-*/")), [])
+
+    def test_split_file_from_publish_reproduces_the_same_assignment(self):
+        build_dataset(self.raw, self.output)
+        saved = yaml.safe_load((self.output / "splits.yaml").read_text())
+        again = self.root / "again"
+        result = build_dataset(self.raw, again, split_file=self.output / "splits.yaml")
+        self.assertEqual(result["algorithm"], "fixed")
+        self.assertEqual(result["group_splits"], {g: s for s, groups in saved.items() for g in groups})
+
+    def test_cli_group_file_check_exit_codes_from_another_directory(self):
+        tool = Path(__file__).resolve().parents[1] / "script" / "build_dataset.py"
+        path = self.group_file(self.group_text(confirmed=False))
+        command = [sys.executable, str(tool), "--raw-root", str(self.raw), "--group-file", str(path)]
+        pending = subprocess.run(command + ["--check-only"], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(pending.returncode, 2)
+        self.assertFalse(self.output.exists())
+        path.write_text(self.group_text(confirmed=True), encoding="utf-8")
+        passed = subprocess.run(command + ["--check-only"], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertEqual(json.loads(passed.stdout)["group_splits"].keys(), {"first", "second"})
 
 
 if __name__ == "__main__":

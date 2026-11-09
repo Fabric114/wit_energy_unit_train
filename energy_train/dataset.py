@@ -2,9 +2,8 @@
 
 import hashlib
 import json
-import math
-import random
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -15,6 +14,13 @@ from .annotations import (
     session_folder, session_inputs,
 )
 from .common import json_text, new_output_directory, sha256, utc_now, valid_name
+from .splitting import (
+    assign_groups, check_duplicate_groups, load_yaml_snapshot, resolve_groups,
+    summarize_groups, summarize_splits, verify_config_snapshots,
+)
+
+__all__ = ["DatasetValidationError", "PreparedDataset", "assign_groups", "build_dataset",
+           "discover_sessions", "inspect_dataset", "prepare_dataset"]
 
 
 class DatasetValidationError(ValueError):
@@ -88,43 +94,59 @@ def inspect_dataset(raw_root, sessions=None):
             "sessions": names, "group_ids": sorted(groups)}
 
 
-def assign_groups(groups, val_ratio=.2, test_ratio=0, seed=42, splits=None):
-    """确定性整组划分；比例按组数近似，每个启用的集合至少有一组。"""
-    groups = sorted(set(groups))
-    if splits is not None:
-        if not isinstance(splits, dict) or set(splits) - {"train", "val", "test"}:
-            raise ValueError("固定划分必须是仅含 train/val/test 的映射")
-        if not splits.get("train") or not splits.get("val"):
-            raise ValueError("固定划分的 train 和 val 都必须有采集组")
-        mapping = {}
-        for split, members in splits.items():
-            if not isinstance(members, list) or any(not isinstance(g, str) for g in members):
-                raise ValueError(f"{split} 必须是采集 group_id 的字符串列表")
-            for group in members:
-                if group in mapping:
-                    raise ValueError(f"采集组重复分配: {group}")
-                mapping[group] = split
-        if set(mapping) != set(groups):
-            raise ValueError(f"固定划分与当前采集组不一致；遗漏 {sorted(set(groups) - set(mapping))}，多余 {sorted(set(mapping) - set(groups))}")
-        return mapping
-    if not (math.isfinite(val_ratio) and math.isfinite(test_ratio)
-            and 0 < val_ratio < 1 and 0 <= test_ratio < 1 and val_ratio + test_ratio < 1):
-        raise ValueError("val-ratio 必须大于 0，test-ratio 不小于 0，二者之和小于 1，且为有限数值")
-    ratios = {"train": 1 - val_ratio - test_ratio, "val": val_ratio}
-    if test_ratio > 0:
-        ratios["test"] = test_ratio
-    if len(groups) < len(ratios):
-        raise ValueError(f"独立采集组不足：至少需要 {len(ratios)} 组，当前只有 {len(groups)} 组；请补采独立场景，不能按帧拆分同一组")
-    counts = {split: 1 for split in ratios}
-    for _ in range(len(groups) - len(ratios)):
-        split = max(ratios, key=lambda key: len(groups) * ratios[key] - counts[key])
-        counts[split] += 1
-    random.Random(seed).shuffle(groups)
-    mapping, offset = {}, 0
-    for split, count in counts.items():
-        mapping.update(dict.fromkeys(groups[offset:offset + count], split))
-        offset += count
-    return mapping
+@dataclass(frozen=True)
+class PreparedDataset:
+    """check 与 build 共用的划分结果；检查或构建都只调用一次 prepare_dataset。"""
+    report: dict
+    records: list
+    assignment: dict
+    split_stats: dict
+    warnings: list
+    group_definition: dict
+    split_config: "dict | None"
+    config_snapshots: tuple
+    algorithm: str
+    seed: int
+    val_ratio: "float | None"
+    test_ratio: "float | None"
+
+
+def prepare_dataset(raw_root, *, sessions=None, val_ratio=.2, test_ratio=0, seed=42,
+                    splits=None, group_file=None, split_file=None):
+    if splits is not None and split_file is not None:
+        raise ValueError("固定划分只能使用 splits 或 split_file 之一")
+    report = inspect_dataset(raw_root, sessions)
+    if report["issues"]:
+        raise DatasetValidationError(report)
+    image_ids = {f"{session}/{name}" for session, source in report["sources"].items()
+                 for name in source["images"]}
+    snapshots, split_config = [], None
+    if split_file is not None:
+        splits, snapshot = load_yaml_snapshot(split_file)
+        snapshots.append(snapshot)
+        split_config = {"source": "file", "path": str(snapshot.path), "sha256": snapshot.sha256, "splits": splits}
+    elif splits is not None:
+        split_config = {"source": "inline", "path": None, "sha256": None, "splits": splits}
+    resolved = resolve_groups(report["records"], image_ids, group_file)
+    if resolved.snapshot is not None:
+        snapshots.append(resolved.snapshot)
+    duplicates = check_duplicate_groups(resolved.records)
+    stats = summarize_groups(resolved.records)
+    groups = sorted({row["split_group_id"] for row in resolved.records})
+    assignment = assign_groups(groups, val_ratio, test_ratio, seed, splits, group_stats=stats)
+    fixed = splits is not None
+    ratios = None if fixed else {"train": 1 - val_ratio - test_ratio, "val": val_ratio,
+                                 **({"test": test_ratio} if test_ratio > 0 else {})}
+    split_stats, warnings = summarize_splits(resolved.records, assignment, ratios,
+                                             excluded_count=len(resolved.excluded))
+    warnings = duplicates + warnings
+    if not resolved.confirmed:
+        warnings.insert(0, {"code": "group_file_unconfirmed", "path": resolved.definition["path"]})
+    return PreparedDataset(
+        report=report, records=resolved.records, assignment=assignment, split_stats=split_stats,
+        warnings=warnings, group_definition=resolved.definition, split_config=split_config,
+        config_snapshots=tuple(snapshots), algorithm="fixed" if fixed else "shuffled_groups_v1",
+        seed=seed, val_ratio=None if fixed else val_ratio, test_ratio=None if fixed else test_ratio)
 
 
 def _verify_sources(raw_root, selected_sessions, report):
@@ -137,26 +159,30 @@ def _verify_sources(raw_root, selected_sessions, report):
 
 
 def build_dataset(raw_root, output, *, sessions=None,
-                  val_ratio=.2, test_ratio=0, seed=42, splits=None):
+                  val_ratio=.2, test_ratio=0, seed=42, splits=None,
+                  group_file=None, split_file=None):
     check_output_location(output, raw_root)
     output = Path(output).resolve()
     if output.exists():
         raise FileExistsError(f"输出已存在，请使用新目录: {output}")
-    report = inspect_dataset(raw_root, sessions)
-    if report["issues"]:
-        raise DatasetValidationError(report)
-    assignment = assign_groups(report["group_ids"], val_ratio, test_ratio, seed, splits)
-    rows = []
-    summary = {"schema_version": 2, "created_at": utc_now(), **report["summary"],
+    prepared = prepare_dataset(raw_root, sessions=sessions, val_ratio=val_ratio, test_ratio=test_ratio,
+                               seed=seed, splits=splits, group_file=group_file, split_file=split_file)
+    if not prepared.group_definition["confirmed"]:
+        raise ValueError("group-file 的 confirmed 不是 true，分组尚未人工核对，拒绝构建")
+    report, assignment, rows = prepared.report, prepared.assignment, []
+    summary = {"schema_version": 3, "created_at": utc_now(), **report["summary"],
                "raw_root": str(Path(raw_root).resolve()),
                "class_names": {"0": "energy_unit"}, "group_splits": assignment,
-               "split_method": "fixed" if splits is not None else "seeded_group_count", "seed": seed,
-               "val_ratio": val_ratio if splits is None else None,
-               "test_ratio": test_ratio if splits is None else None, "sources": report["sources"],
+               "algorithm": prepared.algorithm, "split_method": prepared.algorithm,
+               "group_definition": prepared.group_definition, "split_config": prepared.split_config,
+               "split_stats": prepared.split_stats, "warnings": prepared.warnings,
+               "excluded_images": len(prepared.group_definition.get("exclude", [])),
+               "seed": prepared.seed, "val_ratio": prepared.val_ratio, "test_ratio": prepared.test_ratio,
+               "sources": report["sources"],
                "split_images": {split: 0 for split in sorted(set(assignment.values()))}}
     with new_output_directory(output) as staging:
-        for row in report["records"]:
-            split = assignment[row["group_id"]]
+        for row in prepared.records:
+            split = assignment[row["split_group_id"]]
             source = Path(row["source_image"])
             image_relative = f"images/{split}/{row['session']}/{source.name}"
             label_relative = f"labels/{split}/{row['session']}/{source.stem}.txt"
@@ -178,8 +204,12 @@ def build_dataset(raw_root, output, *, sessions=None,
         data = {"path": str(output), "train": "images/train", "val": "images/val", "names": {0: "energy_unit"}}
         if "test" in assignment.values():
             data["test"] = "images/test"
+        full_split = {split: sorted(g for g, s in assignment.items() if s == split)
+                      for split in ("train", "val", "test") if split in set(assignment.values())}
         (staging / "data.yaml").write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        (staging / "splits.yaml").write_text(yaml.safe_dump(full_split, allow_unicode=True, sort_keys=False), encoding="utf-8")
         (staging / "manifest.jsonl").write_text("".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows), encoding="utf-8")
         (staging / "summary.json").write_text(json_text(summary), encoding="utf-8")
         _verify_sources(raw_root, sessions, report)
+        verify_config_snapshots(prepared.config_snapshots)
     return {**summary, "output": str(output)}
