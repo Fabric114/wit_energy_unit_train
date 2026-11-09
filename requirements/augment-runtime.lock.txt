@@ -1,0 +1,10 @@
+# 离线增强新增的非 OpenCV 依赖精确版本（2026-11-09 受控安装，Python 3.10）。
+# 安装顺序见 docs/augmentation_environment.md：先安装本文件，再对 augment.txt 使用 --no-deps。
+# 不含 OpenCV 发行包；不得并装 opencv-python-headless / opencv-contrib-python。
+annotated-types==0.8.0
+pydantic==2.14.3
+pydantic_core==2.50.4
+scipy==1.15.3
+simsimd==6.5.16
+stringzilla==5.3.2
+typing-inspection==0.4.5

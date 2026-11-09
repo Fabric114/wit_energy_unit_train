@@ -1,0 +1,5 @@
+# 离线增强专用的两个顶层固定版本。
+# 禁止直接执行 `pip install -r requirements/augment.txt`；
+# 必须按 docs/augmentation_environment.md 的受控顺序，并且只使用 --no-deps 安装本文件。
+albumentations==2.0.8
+albucore==0.0.24

@@ -1,0 +1,6 @@
+# 离线增强非 OpenCV 运行依赖的约束，仅用于解析 augment-runtime.lock.txt。
+# 不要直接 pip install -r 本文件；不包含任何 OpenCV 发行包。
+scipy>=1.10
+pydantic>=2.9.2
+stringzilla>=3.10.4
+simsimd>=5.9.2
