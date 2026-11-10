@@ -1,0 +1,27 @@
+# configs/train/yolo11n_offline_control.yaml
+# 离线增强对照：关闭全部在线随机增强，只检查离线增强快照带来的增量。
+# 与 yolo11n.yaml 的区别是有意的：degrees 置 0，不改原基线配置。
+model: weights/pretrained/yolo11n.pt   # 官方 COCO 起点权重，必须是已存在的本地 .pt
+train:
+  epochs: 150
+  batch: 16
+  imgsz: 640
+  patience: 30
+  seed: 42
+  degrees: 0
+  translate: 0
+  scale: 0
+  shear: 0
+  perspective: 0
+  hsv_h: 0
+  hsv_s: 0
+  hsv_v: 0
+  flipud: 0
+  fliplr: 0
+  mosaic: 0
+  mixup: 0
+  cutmix: 0
+  copy_paste: 0
+  bgr: 0
+  close_mosaic: 0
+  augmentations: []   # 清空 Ultralytics 默认的 Albumentations 变换链（否则安装 albumentations 后会隐式启用 Blur 等）

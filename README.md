@@ -48,6 +48,8 @@ python script/doctor.py --camera                 # 枚举相机
 
 # 采集；同一段连续拍摄使用同一个 group-id
 python script/capture_d435.py --session s03_near_front --group-id g03
+# 海康相机采集（读 capture.yaml 的 hik 段；需要先安装 MVS SDK）
+python script/capture_hik.py --session h01_near_front --group-id h01 --serial DA3038934
 
 # 用 OpenVINO 模型生成预标注 JSON
 python script/prelabel_openvino.py --session s03

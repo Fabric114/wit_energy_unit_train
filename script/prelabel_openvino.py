@@ -1,7 +1,7 @@
-"""用 OpenVINO YOLO 模型为 raw/<session>/ 中的 PNG 生成 X-AnyLabeling 预标注 JSON。
+"""用 OpenVINO YOLO 模型为 raw/<session>/ 中的图片生成 X-AnyLabeling 预标注 JSON。
 
 规则：
-- 只处理 raw/<session>/ 直接包含的 PNG，跳过 _delete_ 目录。
+- 只处理 raw/<session>/ 直接包含的 PNG/JPG/BMP，跳过 _delete_ 目录。
 - 已存在同名 JSON 的图片一律跳过，不覆盖任何已有标注（包括人工标注）。
 - 预标注 JSON 写入 checked=false，review_status=pending。人工检查后再在 X-AnyLabeling 中标记通过。
 - 框为矩形，标签统一为 energy_unit。
@@ -22,6 +22,7 @@ DEFAULT_RAW = PROJECT_ROOT / "raw"
 DEFAULT_MODEL = PROJECT_ROOT / "reference_model" / "best_openvino_model" / "best.xml"
 LABEL = "energy_unit"
 INPUT_SIZE = 640
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
 PAD_VALUE = 114
 
 
@@ -100,7 +101,7 @@ def build_json(png: Path, image_bgr: np.ndarray, dets: list[dict]) -> dict:
 
 def process_session(compiled, session_dir: Path, conf: float, iou: float) -> dict:
     stats = {"written": 0, "skipped_existing": 0, "unreadable": 0, "boxes": 0}
-    for png in sorted(session_dir.glob("*.png")):
+    for png in sorted(p for p in session_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES):
         out = png.with_suffix(".json")
         if out.exists():
             stats["skipped_existing"] += 1

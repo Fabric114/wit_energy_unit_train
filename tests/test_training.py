@@ -602,6 +602,62 @@ class SchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(result["group_splits"], {"g1": "train", "g2": "val"})
 
 
+OFFLINE_CONTROL = PROJECT_ROOT / "configs/train/yolo11n_offline_control.yaml"
+ONLINE_AUG_KEYS = ("degrees", "translate", "scale", "shear", "perspective", "hsv_h", "hsv_s", "hsv_v",
+                   "flipud", "fliplr", "mosaic", "mixup", "cutmix", "copy_paste", "bgr", "close_mosaic")
+
+
+class OfflineControlTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_config_file_matches_spec(self):
+        content = yaml.safe_load(OFFLINE_CONTROL.read_text(encoding="utf-8"))
+        self.assertEqual(content["model"], "weights/pretrained/yolo11n.pt")
+        train = content["train"]
+        self.assertEqual((train["epochs"], train["batch"], train["imgsz"], train["patience"], train["seed"]),
+                         (150, 16, 640, 30, 42))
+        self.assertEqual(train["augmentations"], [])
+        for key in ONLINE_AUG_KEYS:
+            self.assertEqual(train[key], 0, key)
+
+    def test_plan_passes_empty_augmentations_and_zeros_to_yolo(self):
+        cfg = load_config(OFFLINE_CONTROL)
+        dataset = {"data_yaml": str(self.root / "data.yaml"), "dataset_dir": str(self.root / "energy_v1")}
+        plan = plan_run(cfg, dataset, runs_root=self.root / "runs", name="offline")
+        args = plan["stages"][0]["args"]
+        self.assertIn("augmentations", args)
+        self.assertEqual(args["augmentations"], [])
+        for key in ONLINE_AUG_KEYS:
+            self.assertEqual(args[key], 0, key)
+        self.assertEqual((args["epochs"], args["imgsz"]), (150, 640))
+
+
+class UltralyticsAugmentationSmokeTests(unittest.TestCase):
+    """真实库冒烟：不加载模型、不用 GPU，只验证 Ultralytics 对空变换链的处理。"""
+
+    def test_ultralytics_default_chain_is_nonempty_control(self):
+        from ultralytics.data.augment import Albumentations
+        default = Albumentations(p=1.0, transforms=None)
+        self.assertIsNotNone(default.transform, "默认变换链构造失败，控制对照无效")
+        self.assertGreater(len(default.transform.transforms), 0)
+
+    def test_empty_augmentations_builds_empty_chain(self):
+        from ultralytics.data.augment import Albumentations
+        empty = Albumentations(p=1.0, transforms=[])
+        self.assertIsNotNone(empty.transform, "Ultralytics 拒绝空变换链，需报告而非静默删参数")
+        self.assertEqual(len(empty.transform.transforms), 0)
+
+    def test_cfg_accepts_augmentations_key(self):
+        from ultralytics.cfg import get_cfg
+        cfg = get_cfg(overrides={"augmentations": []})
+        self.assertEqual(cfg.augmentations, [])
+
+
 
 if __name__ == "__main__":
     unittest.main()

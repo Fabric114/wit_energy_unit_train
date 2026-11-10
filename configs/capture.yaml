@@ -1,16 +1,41 @@
-# CLI parameters override this file. Relative paths are relative to project root.
-output_root: raw
-width: 640
-height: 480
-fps: 30
-interval: 0.5
-warmup_frames: 30
-max_images: 0            # maximum NEW images this invocation; 0 = unlimited
-duration: 0              # seconds including warmup; 0 = unlimited
-preview: true
-auto: true
-blur_threshold: 50.0     # scene-dependent diagnostic, not a universal cutoff
-reject_blur: false
-duplicate_threshold: 2.0 # BGR mean absolute difference; 0 disables filtering
-serial: null
-note: ""
+# One section per camera: capture_d435.py reads d435, capture_hik.py reads hik.
+# CLI parameters override the section. Relative paths are relative to project root.
+d435:
+  output_root: raw
+  width: 640
+  height: 480
+  fps: 30
+  interval: 0.5
+  warmup_frames: 30
+  max_images: 0            # maximum NEW images this invocation; 0 = unlimited
+  duration: 0              # seconds including warmup; 0 = unlimited
+  preview: true
+  auto: true
+  blur_threshold: 50.0     # scene-dependent diagnostic, not a universal cutoff
+  reject_blur: false
+  duplicate_threshold: 2.0 # BGR mean absolute difference; 0 disables filtering
+  serial: null
+  note: ""
+
+hik:
+  output_root: raw
+  width: 1440              # MV-CS016-10UC full sensor; smaller values use a centered ROI
+  height: 1080
+  fps: 30
+  interval: 0.5
+  warmup_frames: 30        # also lets auto exposure / white balance settle
+  max_images: 0
+  duration: 0
+  preview: true
+  auto: true
+  blur_threshold: 50.0     # Laplacian variance depends on resolution; not comparable with d435
+  reject_blur: false
+  duplicate_threshold: 2.0
+  serial: null             # e.g. DA3038934; required when more than one Hikrobot camera is connected
+  note: ""
+  exposure_auto: true      # continuous auto exposure; false uses exposure_time
+  exposure_time: 5000.0    # microseconds
+  gain_auto: true          # continuous auto gain; false uses gain
+  gain: 0.0                # dB
+  balance_white_auto: true # continuous auto white balance
+  sdk_root: /opt/MVS       # MVS install directory (Python interface under Samples/*/Python/MvImport)
